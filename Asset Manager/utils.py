@@ -58,27 +58,67 @@ def detect_sequence(filepath):
     return (base_name, int(digits), extension, frame_pattern, padding)
 
 
+# Directory index shared by all sequence lookups of ONE scan. Without it every
+# sequence re-listed its folder and re-parsed every name in it. Only active
+# between begin_sequence_cache() and end_sequence_cache(); outside a scan each
+# call reads the disk directly, as before.
+_dir_index_cache = None
+
+# A frame gap wider than this is not a real sequence (a number that looks like
+# a date or timecode). Listing every missing frame would allocate millions of
+# ints and could exhaust memory, so the gap list is skipped for such files.
+MAX_FRAME_SPAN_FOR_MISSING = 100000
+
+
+def begin_sequence_cache():
+    """Start a scan: folders are listed once and reused until end_sequence_cache()."""
+    global _dir_index_cache
+    _dir_index_cache = {}
+
+
+def end_sequence_cache():
+    """End of a scan: drop the folder index so later lookups see fresh files."""
+    global _dir_index_cache
+    _dir_index_cache = None
+
+
+def _build_dir_index(directory):
+    """{frame_pattern: sorted frame numbers} for every sequence in one folder."""
+    index = {}
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return index
+    for name in names:
+        info = detect_sequence(name)
+        if info:
+            index.setdefault(info[3], []).append(info[1])
+    for frames in index.values():
+        frames.sort()
+    return index
+
+
 def find_sequence_range(directory, base_pattern, padding=None):
     """
     Frames in `directory` whose name matches `base_pattern` (e.g. fire_%04d.png).
     Returns (first_frame, last_frame, missing_frames, frame_count)
     """
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return None, None, [], 0
+    if _dir_index_cache is not None:
+        if directory not in _dir_index_cache:
+            _dir_index_cache[directory] = _build_dir_index(directory)
+        index = _dir_index_cache[directory]
+    else:
+        index = _build_dir_index(directory)
 
-    frames = []
-    for name in names:
-        info = detect_sequence(name)
-        if info and info[3] == base_pattern:
-            frames.append(info[1])
-
+    frames = index.get(base_pattern)
     if not frames:
         return None, None, [], 0
 
-    frames.sort()
     first_frame, last_frame = frames[0], frames[-1]
+    if last_frame - first_frame > MAX_FRAME_SPAN_FOR_MISSING:
+        # Not a real frame sequence: report the range but not the gaps
+        return first_frame, last_frame, [], len(frames)
+
     missing = sorted(set(range(first_frame, last_frame + 1)) - set(frames))
     return first_frame, last_frame, missing, len(frames)
 

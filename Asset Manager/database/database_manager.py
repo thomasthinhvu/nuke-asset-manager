@@ -231,6 +231,16 @@ class DatabaseManager:
                 return AssetModel.from_dict(dict(row))
             return None
     
+    def get_file_stamps(self) -> Dict[str, tuple]:
+        """
+        filepath -> (file_size, modified_time) for every asset, in one query.
+        A rescan compares these with the disk and skips files that did not change.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT filepath, file_size, modified_time FROM assets")
+            return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
     def delete_asset(self, asset_id: int) -> bool:
         """Delete an asset"""
         with self._get_connection() as conn:

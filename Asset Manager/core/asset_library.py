@@ -155,47 +155,43 @@ class AssetLibrary:
         if not folder:
             raise ValueError(f"Folder ID {folder_id} not found")
         
-        # Set up callbacks
+        # filepath -> (file_size, modified_time) as stored in the library.
+        # Loaded once, on the scanner thread, the first time it is needed.
+        known_stamps = None
+
+        def is_unchanged(filepath):
+            """True when the library already has this exact file version."""
+            nonlocal known_stamps
+            if known_stamps is None:
+                known_stamps = self.db.get_file_stamps()
+            stamp = known_stamps.get(filepath)
+            if stamp is None:
+                return False
+            try:
+                st = os.stat(filepath)
+            except OSError:
+                return False
+            return stamp == (st.st_size, st.st_mtime)
+
+        def on_batch(batch: List[AssetItem]):
+            """Called from the scanner thread every few hundred files, so a crash
+            or cancel keeps everything found so far."""
+            self._save_scanned(batch, folder_id)
+
         def on_complete(assets: List[AssetItem]):
             """Called from scanner thread - keep this lightweight"""
             try:
-                # Add assets to database
-                added_count = 0
-                updated_count = 0
-                
-                for asset in assets:
-                    asset.folder_id = folder_id
-                    
-                    # Check if asset already exists
-                    existing = self.db.get_asset_by_path(asset.filepath)
-                    if existing:
-                        self._update_rescanned(existing, asset)
-                        updated_count += 1
-                    else:
-                        # Add new asset
-                        asset_id = self.db.add_asset(AssetModel.from_dict(asset.to_dict()))
-                        asset.id = asset_id
-                        added_count += 1
-                    
-                    # Add to cache
-                    self._asset_cache[asset.id] = asset
-                
-                # Update folder scan timestamp
                 self.db.update_folder(folder_id, {
                     'last_scanned': datetime.now().timestamp(),
-                    'asset_count': len(assets)
+                    'asset_count': len(self.db.search_assets(folder_id=folder_id)),
                 })
-                
-                log.debug(f"Scan complete: {added_count} new, {updated_count} updated")
-                
                 # Notify background processor of new assets
                 self._processed_assets.clear()
-                
             except Exception as e:
                 log.warning(f"Error in scan completion: {e}")
                 import traceback
                 traceback.print_exc()
-            
+
             # Call user callback - keep this simple
             if complete_callback:
                 try:
@@ -204,15 +200,36 @@ class AssetLibrary:
                     log.warning(f"Error calling user callback: {e}")
                     import traceback
                     traceback.print_exc()
-        
+
         # Start scan
         self.scanner.scan_directory_async(
             folder.path,
             folder.recursive,
             progress_callback,
-            on_complete
+            on_complete,
+            batch_callback=on_batch,
+            skip_check=is_unchanged,
         )
-    
+
+    def _save_scanned(self, batch: List[AssetItem], folder_id: int):
+        """Write one scan batch to the database and the in-memory cache."""
+        added_count = 0
+        updated_count = 0
+        for asset in batch:
+            asset.folder_id = folder_id
+            try:
+                existing = self.db.get_asset_by_path(asset.filepath)
+                if existing:
+                    self._update_rescanned(existing, asset)
+                    updated_count += 1
+                else:
+                    asset.id = self.db.add_asset(AssetModel.from_dict(asset.to_dict()))
+                    added_count += 1
+                self._asset_cache[asset.id] = asset
+            except Exception as e:
+                log.warning(f"Could not save {asset.filepath}: {e}")
+        log.debug(f"Scan batch saved: {added_count} new, {updated_count} updated")
+
     def scan_all_folders(self, 
                         progress_callback: Optional[Callable] = None,
                         complete_callback: Optional[Callable] = None):

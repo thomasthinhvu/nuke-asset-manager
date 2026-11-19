@@ -475,7 +475,8 @@ class AssetManagerPanel(QtWidgets.QWidget):
             self._scan_dialog = None
         self._reload_all()
         self.library.generate_all_thumbnails()
-        self._set_status(f"Scan complete: {len(self._visible(assets))} assets")
+        count = len(self._visible(self.library.search_assets(folder_id=folder_id)))
+        self._set_status(f"Scan complete: {count} assets")
         if self._scan_queue:
             QtCore.QTimer.singleShot(0, self._start_next_scan)
 

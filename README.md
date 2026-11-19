@@ -90,3 +90,13 @@ Bug reports and ideas are welcome. Open an issue here on GitHub or send an email
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## My Modification update
+
+- [26-11-19]
+  - **Scan crash / lost progress:** results are now saved to the library every 200 files during the scan, instead of only after 100%. A crash or cancel keeps everything already found
+  - **Faster rescans:** files whose size and modified time match the library are skipped, so a rescan after a crash only processes what is new or changed
+  - **Memory:** scan results are no longer held in RAM for the whole scan
+  - **Sequences:** each folder is listed once per scan instead of once per sequence. Frame gaps wider than 100 000 frames no longer build a full list of missing frames
+  - **Robustness:** a UI error during progress reporting, or an unexpected error on one file, no longer stops the scan
+  - **Status line:** "Scan complete" now shows the total number of assets in that folder
