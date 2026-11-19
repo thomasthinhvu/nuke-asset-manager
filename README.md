@@ -100,3 +100,4 @@ MIT. See [LICENSE](LICENSE).
   - **Sequences:** each folder is listed once per scan instead of once per sequence. Frame gaps wider than 100 000 frames no longer build a full list of missing frames
   - **Robustness:** a UI error during progress reporting, or an unexpected error on one file, no longer stops the scan
   - **Status line:** "Scan complete" now shows the total number of assets in that folder
+  - **Scan crash on EXR sequences:** the progress dialog is now refreshed by a timer (about 7 times a second) instead of from every progress signal. The old way re-entered the same handler once per queued update, and fast scans overflowed the stack

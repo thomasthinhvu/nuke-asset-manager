@@ -449,6 +449,12 @@ class AssetManagerPanel(QtWidgets.QWidget):
         dlg.canceled.connect(self.library.scanner.cancel_scan)
         dlg.show()
         self._scan_dialog = dlg
+        self._scan_latest = None
+        self._scan_flushing = False
+        if getattr(self, "_scan_timer", None) is None:
+            self._scan_timer = QtCore.QTimer(self)
+            self._scan_timer.setInterval(150)   # UI refresh rate for scan progress
+            self._scan_timer.timeout.connect(self._flush_scan_progress)
 
         # Called from the scanner thread -> only emit signals here
         def on_progress(current, total, filepath):
@@ -460,15 +466,37 @@ class AssetManagerPanel(QtWidgets.QWidget):
         self.library.scan_folder(folder_id, on_progress, on_complete)
 
     def _on_scan_progress(self, current, total, filepath):
-        dlg = self._scan_dialog
-        if dlg is None:
+        # Only remember the latest value here. Updating the dialog inside this
+        # handler calls processEvents(), which delivers the next queued progress
+        # signal into this same method. On fast scans (EXR sequences) that
+        # nests thousands of calls deep and crashes Nuke.
+        self._scan_latest = (current, total, filepath)
+        if not self._scan_timer.isActive():
+            self._scan_timer.start()
+
+    def _flush_scan_progress(self):
+        if self._scan_flushing:
             return
-        dlg.setMaximum(max(1, total))
-        dlg.setValue(min(current, total))
-        name = os.path.basename(filepath)
-        dlg.setLabelText(f"{current} / {total}\n{name}")
+        dlg = self._scan_dialog
+        latest = self._scan_latest
+        if dlg is None or latest is None:
+            self._scan_timer.stop()
+            return
+        self._scan_latest = None
+        self._scan_flushing = True
+        try:
+            current, total, filepath = latest
+            dlg.setMaximum(max(1, total))
+            dlg.setValue(min(current, total))
+            name = os.path.basename(filepath)
+            dlg.setLabelText(f"{current} / {total}\n{name}")
+        finally:
+            self._scan_flushing = False
 
     def _on_scan_completed(self, assets, folder_id):
+        if getattr(self, "_scan_timer", None) is not None:
+            self._scan_timer.stop()
+        self._scan_latest = None
         if self._scan_dialog is not None:
             self._scan_dialog.reset()
             self._scan_dialog.deleteLater()
