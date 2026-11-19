@@ -24,6 +24,7 @@ DRAG_MARKER = 'ASSET_MANAGER_DROP_V1'
 
 _window = None
 _drop_callback_installed = False
+_quit_hook_installed = False
 
 
 # ------------------------------------------------------------------
@@ -50,23 +51,88 @@ def _refresh_menu_entry(parent):
             "Restart Nuke to see the change.\n(A backup of menu.py was saved.)")
 
 
-class AssetManagerWindow(QtWidgets.QMainWindow):
-    """Main window: remembers size/position and panel layout on close."""
+def _on_app_quit():
+    """Stop all background workers/timers cleanly before Nuke tears down Qt."""
+    global _window
+    if _window is None:
+        return
+    try:
+        panel = _window.centralWidget()
+        if panel is not None:
+            try:
+                cfg = panel.library.config
+                cfg.config['window_geometry'] = (
+                    _window.saveGeometry().toBase64().data().decode('ascii')
+                )
+                panel.save_state()
+            except Exception:
+                pass
+            if hasattr(panel, 'shutdown'):
+                panel.shutdown()
+    except RuntimeError:
+        pass
+    _window = None
+
+
+def _install_quit_hook():
+    global _quit_hook_installed
+    if _quit_hook_installed:
+        return
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(_on_app_quit)
+        _quit_hook_installed = True
+
+
+class AssetManagerWindow(QtWidgets.QDialog):
+    """Main window: remembers size/position and hides safely on close."""
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(QtCore.Qt.Window)
+        super(AssetManagerWindow, self).__init__(parent)
+        self.setWindowFlags(
+            QtCore.Qt.Window
+            | QtCore.Qt.WindowMinimizeButtonHint
+            | QtCore.Qt.WindowMaximizeButtonHint
+            | QtCore.Qt.WindowCloseButtonHint
+        )
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
         self.setWindowTitle("Asset Manager")
+        self._panel = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._layout = layout
+
+    def setCentralWidget(self, widget):
+        self._panel = widget
+        self._layout.addWidget(widget)
+
+    def centralWidget(self):
+        return self._panel
+
+    def reject(self):
+        """Route Esc through closeEvent so state is saved and window hides safely."""
+        self.close()
 
     def closeEvent(self, event):
         panel = self.centralWidget()
-        try:
-            cfg = panel.library.config
-            cfg.config['window_geometry'] = bytes(self.saveGeometry().toBase64()).decode('ascii')
-            panel.save_state()   # also writes the config file
-        except Exception as e:
-            log.warning("Could not save window state: %s", e)
-        super().closeEvent(event)
+        if panel is not None:
+            try:
+                cfg = panel.library.config
+                cfg.config['window_geometry'] = (
+                    self.saveGeometry().toBase64().data().decode('ascii')
+                )
+                panel.save_state()   # also writes the config file
+            except Exception as e:
+                log.warning("Could not save window state: %s", e)
+            try:
+                if hasattr(panel, 'pause_background'):
+                    panel.pause_background()
+            except Exception as e:
+                log.warning("Could not pause background tasks: %s", e)
+        # Hide instead of destroying to prevent Nuke Qt event-loop crash/hang
+        event.ignore()
+        self.hide()
 
 
 def show_asset_manager():
@@ -74,9 +140,13 @@ def show_asset_manager():
     global _window
 
     _install_drop_callback()
+    _install_quit_hook()
 
     if _window is not None:
         try:
+            panel = _window.centralWidget()
+            if panel is not None and hasattr(panel, 'resume_background'):
+                panel.resume_background()
             _window.show()
             _window.raise_()
             _window.activateWindow()
@@ -92,7 +162,7 @@ def show_asset_manager():
     # Parent to Nuke's main window so it stays in front of Nuke,
     # Qt.Window keeps it a separate, movable window.
     window = AssetManagerWindow(nuke_main)
-    panel = AssetManagerPanel()
+    panel = AssetManagerPanel(window)
     window.setCentralWidget(panel)
 
     saved = panel.library.config.get('window_geometry')

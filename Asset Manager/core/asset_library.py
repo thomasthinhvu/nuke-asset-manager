@@ -340,8 +340,13 @@ class AssetLibrary:
             self._bg_stop_event.clear()
 
         def run():
-            from concurrent.futures import ThreadPoolExecutor
+            import queue as _queue
             while True:
+                if self._bg_stop_event.is_set():
+                    with self._thumb_lock:
+                        self._thumb_running = False
+                        self.thumb_total = self.thumb_done = 0
+                    return
                 force_now = self._thumb_force
                 assets = [a for a in self.get_all_assets()
                           if self.thumbnail_gen.can_have_thumbnail(a.filepath)
@@ -351,16 +356,35 @@ class AssetLibrary:
                     log.debug("Generating %d thumbnails...", len(assets))
                     self.thumb_total = len(assets)
                     self.thumb_done = 0
-                    with ThreadPoolExecutor(max_workers=self.THUMB_WORKERS) as pool:
-                        for _ in pool.map(lambda a: self._safe_thumbnail(a, force_now), assets):
-                            self.thumb_done += 1
+                    work_q = _queue.Queue()
+                    for a in assets:
+                        work_q.put(a)
+                    done_lock = threading.Lock()
+
+                    def worker():
+                        while not self._bg_stop_event.is_set():
+                            try:
+                                a = work_q.get_nowait()
+                            except _queue.Empty:
+                                return
+                            self._safe_thumbnail(a, force_now)
+                            with done_lock:
+                                self.thumb_done += 1
+
+                    n_workers = min(self.THUMB_WORKERS, len(assets))
+                    threads = [threading.Thread(target=worker, daemon=True)
+                               for _ in range(n_workers)]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join()
                 with self._thumb_lock:
                     if not self._thumb_dirty or self._bg_stop_event.is_set():
                         self._thumb_running = False
                         self.thumb_total = self.thumb_done = 0
                         break
                     self._thumb_dirty = False
-            if on_done:
+            if on_done and not self._bg_stop_event.is_set():
                 on_done()
 
         threading.Thread(target=run, daemon=True).start()
@@ -379,8 +403,9 @@ class AssetLibrary:
             return None
 
     def stop_background_processing(self):
-        """Stop thumbnail generation (called when the window closes)."""
+        """Stop thumbnail generation and any active scan."""
         self._bg_stop_event.set()
+        self.scanner.cancel_scan()
 
     def search_assets(self, 
                      query: str = "",

@@ -20,9 +20,16 @@ def get_nuke_main_window():
     
     app = QtWidgets.QApplication.instance()
     if app:
+        fallback = None
         for widget in app.topLevelWidgets():
-            if widget.objectName() == 'NukeMainWindow' or 'Nuke' in widget.windowTitle():
+            if widget.objectName() == 'NukeMainWindow':
                 return widget
+            if 'Nuke' in widget.windowTitle():
+                if isinstance(widget, QtWidgets.QMainWindow):
+                    return widget
+                if fallback is None:
+                    fallback = widget
+        return fallback
     
     return None
 

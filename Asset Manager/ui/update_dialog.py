@@ -27,22 +27,31 @@ class _Worker(QtCore.QObject):
     finished = Signal(int)            # files written
     failed = Signal(str)
 
+    def _safe_emit(self, signal, *args):
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
+
     def check(self):
         def run():
             try:
-                self.checked.emit(updater.check(APP_ROOT))
+                self._safe_emit(self.checked, updater.check(APP_ROOT))
             except Exception as e:
-                self.failed.emit(str(e))
+                self._safe_emit(self.failed, str(e))
         threading.Thread(target=run, daemon=True).start()
 
     def apply(self, plan):
         def run():
             try:
-                n = updater.apply(APP_ROOT, plan,
-                                  progress=lambda d, t, p: self.progress.emit(d, t, p))
-                self.finished.emit(n)
+                n = updater.apply(
+                    APP_ROOT,
+                    plan,
+                    progress=lambda d, t, p: self._safe_emit(self.progress, d, t, p),
+                )
+                self._safe_emit(self.finished, n)
             except Exception as e:
-                self.failed.emit(str(e))
+                self._safe_emit(self.failed, str(e))
         threading.Thread(target=run, daemon=True).start()
 
 
@@ -50,6 +59,8 @@ class UpdateDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setWindowFlags(Qt.Window)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setWindowTitle("Asset Manager - Updates")
         self.setObjectName("amRoot")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -95,16 +106,23 @@ class UpdateDialog(QtWidgets.QDialog):
         self.update_btn.setEnabled(False)
         self.update_btn.clicked.connect(self._start_update)
         self.close_btn = QtWidgets.QPushButton("Close")
-        self.close_btn.clicked.connect(self.close)
+        self.close_btn.clicked.connect(self.hide)
         buttons.addWidget(self.update_btn)
         buttons.addWidget(self.close_btn)
         lay.addLayout(buttons)
 
         self.worker = _Worker(self)
-        self.worker.checked.connect(self._on_checked)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.failed.connect(self._on_failed)
+        self.worker.checked.connect(self._on_checked, Qt.QueuedConnection)
+        self.worker.progress.connect(self._on_progress, Qt.QueuedConnection)
+        self.worker.finished.connect(self._on_finished, Qt.QueuedConnection)
+        self.worker.failed.connect(self._on_failed, Qt.QueuedConnection)
+
+    def reject(self):
+        self.close()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
 
     def start_check(self):
         self._plan = None
@@ -179,8 +197,16 @@ def show_update_dialog(parent=None):
             parent = get_nuke_main_window()
         except Exception:
             parent = None
-    if _dialog is None:
-        _dialog = UpdateDialog(parent)
+    if _dialog is not None:
+        try:
+            _dialog.show()
+            _dialog.raise_()
+            _dialog.activateWindow()
+            _dialog.start_check()
+            return _dialog
+        except RuntimeError:
+            _dialog = None
+    _dialog = UpdateDialog(parent)
     _dialog.show()
     _dialog.raise_()
     _dialog.activateWindow()
@@ -195,6 +221,7 @@ def show_update_dialog(parent=None):
 class UpdateNotifier(QtCore.QObject):
     """Emits `available(version)` when GitHub has a newer APP_VERSION."""
     available = Signal(str)
+    finished = Signal()
 
     def check(self):
         def run():
@@ -202,7 +229,68 @@ class UpdateNotifier(QtCore.QObject):
                 repo, branch = updater.repo_settings(APP_ROOT)
                 remote = updater.remote_version(repo, branch)
                 if remote and updater.version_tuple(remote) > updater.version_tuple(APP_VERSION):
-                    self.available.emit(remote)
+                    try:
+                        self.available.emit(remote)
+                    except RuntimeError:
+                        return
             except Exception:
                 pass   # offline etc. - stay quiet
+            finally:
+                try:
+                    self.finished.emit()
+                except RuntimeError:
+                    pass
         threading.Thread(target=run, daemon=True).start()
+
+
+_silent_notifiers = []  # keep notifiers alive until their check finishes
+
+
+class _SilentUpdatePrompt(QtCore.QObject):
+    """Receives UpdateNotifier signals on the GUI thread and prompts once."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._parent_window = parent
+        self._notifier = UpdateNotifier(self)
+        self._notifier.available.connect(self._on_available, Qt.QueuedConnection)
+        self._notifier.finished.connect(self._on_finished, Qt.QueuedConnection)
+
+    def start(self):
+        self._notifier.check()
+
+    def _on_available(self, remote_version):
+        box = QtWidgets.QMessageBox(self._parent_window)
+        box.setWindowTitle("Asset Manager")
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setText(
+            f"A new version is available.\n\nInstalled: {APP_VERSION}\nGitHub: {remote_version}"
+        )
+        update_btn = box.addButton("Update Now", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("OK", QtWidgets.QMessageBox.RejectRole)
+        if hasattr(box, "exec"):
+            box.exec()
+        else:
+            box.exec_()
+        if box.clickedButton() is update_btn:
+            show_update_dialog(self._parent_window)
+
+    def _on_finished(self):
+        try:
+            _silent_notifiers.remove(self)
+        except ValueError:
+            pass
+        self.deleteLater()
+
+
+def check_for_updates_silently(parent=None):
+    """Quiet background check for newer GitHub version."""
+    if parent is None:
+        try:
+            from ..nuke_integration.nuke_utils import get_nuke_main_window
+            parent = get_nuke_main_window()
+        except Exception:
+            parent = None
+    prompt = _SilentUpdatePrompt(parent)
+    _silent_notifiers.append(prompt)
+    prompt.start()

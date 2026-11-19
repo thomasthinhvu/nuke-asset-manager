@@ -9,9 +9,9 @@ Asset Grid - thumbnails in grid or list view.
 """
 
 import os
+import queue
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
 try:
     from PySide2 import QtWidgets, QtCore, QtGui
@@ -101,29 +101,57 @@ def asset_exists(asset):
 
 class ThumbLoader(QtCore.QObject):
     """
-    Decodes thumbnail files into QImages in worker threads.
+    Decodes thumbnail files into QImages in daemon worker threads.
     request(key, producer): producer() runs in the worker and returns a file
     path (lets hover previews run ffmpeg first). Result arrives in `loaded`.
+    Uses daemon threads (not ThreadPoolExecutor) so Python's atexit never
+    blocks or crashes Nuke on exit.
     """
     loaded = Signal(str, QtGui.QImage)
 
     def __init__(self, parent=None, workers=2):
         super().__init__(parent)
-        self._pool = ThreadPoolExecutor(max_workers=workers)
+        self._queue = queue.Queue()
         self._pending = set()
         self._lock = threading.Lock()
+        self._stopped = False
+        self._worker_count = workers
         self.max_size = QSize(CARD_W_MAX * 2, thumb_height(CARD_W_MAX) * 2)
+        for _ in range(workers):
+            threading.Thread(target=self._loop, daemon=True).start()
 
     def request(self, key, producer=None):
+        if self._stopped:
+            return
         with self._lock:
             if key in self._pending:
                 return
             self._pending.add(key)
-        self._pool.submit(self._work, key, producer or (lambda: key))
+        self._queue.put((key, producer or (lambda: key)))
+
+    def _loop(self):
+        while not self._stopped:
+            item = self._queue.get()
+            if item is None or self._stopped:
+                break
+            key, producer = item
+            self._work(key, producer)
+
+    def _safe_emit(self, key, img):
+        if self._stopped:
+            return
+        try:
+            self.loaded.emit(key, img)
+        except RuntimeError:
+            self._stopped = True
 
     def _work(self, key, producer):
         try:
+            if self._stopped:
+                return
             path = producer()
+            if self._stopped:
+                return
             img = QtGui.QImage()
             if path and os.path.exists(path):
                 reader = QtGui.QImageReader(path)
@@ -132,15 +160,27 @@ class ThumbLoader(QtCore.QObject):
                                        or size.height() > self.max_size.height()):
                     reader.setScaledSize(size.scaled(self.max_size, Qt.KeepAspectRatio))
                 img = reader.read()
-            self.loaded.emit(key, img)
+            self._safe_emit(key, img)
         except Exception:
-            self.loaded.emit(key, QtGui.QImage())
+            self._safe_emit(key, QtGui.QImage())
         finally:
             with self._lock:
                 self._pending.discard(key)
 
+    def clear_pending(self):
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            self._pending.clear()
+
     def shutdown(self):
-        self._pool.shutdown(wait=False)
+        self._stopped = True
+        self.clear_pending()
+        for _ in range(self._worker_count):
+            self._queue.put(None)
 
 
 class PreviewWorker(QtCore.QObject):
@@ -161,11 +201,14 @@ class PreviewWorker(QtCore.QObject):
         self._queue = deque()
         self._cond = threading.Condition()
         self._busy = None
+        self._stopped = False
         threading.Thread(target=self._run, daemon=True).start()
 
     def request(self, asset_path, duration, size):
+        if self._stopped:
+            return
         with self._cond:
-            if asset_path == self._busy:
+            if self._stopped or asset_path == self._busy:
                 return
             self._queue = deque(j for j in self._queue if j[0] != asset_path)
             self._queue.append((asset_path, duration, size))
@@ -173,11 +216,19 @@ class PreviewWorker(QtCore.QObject):
                 self._queue.popleft()          # drop the oldest
             self._cond.notify()
 
+    def stop(self):
+        with self._cond:
+            self._stopped = True
+            self._queue.clear()
+            self._cond.notify_all()
+
     def _run(self):
         while True:
             with self._cond:
-                while not self._queue:
+                while not self._queue and not self._stopped:
                     self._cond.wait()
+                if self._stopped:
+                    return
                 job = self._queue.pop()        # newest first
                 self._busy = job[0]
             try:
@@ -187,7 +238,13 @@ class PreviewWorker(QtCore.QObject):
             finally:
                 with self._cond:
                     self._busy = None
-            self.ready.emit(job[0])
+            if self._stopped:
+                return
+            try:
+                self.ready.emit(job[0])
+            except RuntimeError:
+                self._stopped = True
+                return
 
 
 class MissingChecker(QtCore.QObject):
@@ -197,8 +254,15 @@ class MissingChecker(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.generation = 0
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+        self.generation += 1
 
     def check(self, assets):
+        if self._stopped:
+            return
         self.generation += 1
         gen = self.generation
         items = list(assets)
@@ -206,10 +270,15 @@ class MissingChecker(QtCore.QObject):
         def run():
             result = {}
             for a in items:
-                if gen != self.generation:
-                    return          # a newer check started
+                if self._stopped or gen != self.generation:
+                    return          # stopped or a newer check started
                 result[id(a)] = not asset_exists(a)
-            self.checked.emit(gen, result)
+            if self._stopped or gen != self.generation:
+                return
+            try:
+                self.checked.emit(gen, result)
+            except RuntimeError:
+                self._stopped = True
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -378,15 +447,16 @@ class AssetGridWidget(QtWidgets.QWidget):
         self._hover_buckets = 20
         self._hover_last_key = None
         self._hover_item = None
+        self._closed = False
 
         self.loader = ThumbLoader(self)
-        self.loader.loaded.connect(self._on_image_loaded)
+        self.loader.loaded.connect(self._on_image_loaded, Qt.QueuedConnection)
         self.missing_checker = MissingChecker(self)
-        self.missing_checker.checked.connect(self._on_missing_checked)
+        self.missing_checker.checked.connect(self._on_missing_checked, Qt.QueuedConnection)
         self.preview_worker = None
         if asset_library is not None:
             self.preview_worker = PreviewWorker(asset_library.thumbnail_gen, self._hover_buckets, self)
-            self.preview_worker.ready.connect(self._on_preview_ready)
+            self.preview_worker.ready.connect(self._on_preview_ready, Qt.QueuedConnection)
         self._hover_cache = {}            # frame path -> QPixmap (small, bounded)
         self._hover_pos = None
         self._loading_items = []          # QListWidgetItems aren't hashable in PySide6
@@ -505,6 +575,8 @@ class AssetGridWidget(QtWidgets.QWidget):
         self.loader.request(path)
 
     def _on_image_loaded(self, path, image):
+        if self._closed:
+            return
         items = self._waiting.pop(path, [])
         if image.isNull():
             return
@@ -523,6 +595,8 @@ class AssetGridWidget(QtWidgets.QWidget):
 
     def _request_missing_thumbnails(self):
         """Thumbnails created by the background generator since the last look."""
+        if self._closed or not self.isVisible():
+            return
         lw = self.list_widget
         gen = self.asset_library.thumbnail_gen if self.asset_library else None
         for i in range(lw.count()):
@@ -539,7 +613,7 @@ class AssetGridWidget(QtWidgets.QWidget):
                 self._attach_thumbnail(item, path)
 
     def _on_missing_checked(self, generation, result):
-        if generation != self.missing_checker.generation:
+        if self._closed or generation != self.missing_checker.generation:
             return
         changed = False
         for asset in self._assets:
@@ -625,6 +699,8 @@ class AssetGridWidget(QtWidgets.QWidget):
 
     # ---------------------------------------------------------- keys + hover scrub
     def eventFilter(self, obj, event):
+        if self._closed:
+            return False
         if obj is self.list_widget and event.type() == QtCore.QEvent.KeyPress:
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self._create_selected()
@@ -742,6 +818,8 @@ class AssetGridWidget(QtWidgets.QWidget):
         return None
 
     def _on_preview_ready(self, asset_path):
+        if self._closed:
+            return
         for item in list(self._loading_items):
             try:
                 a = item.data(ROLE_ASSET)
@@ -760,6 +838,31 @@ class AssetGridWidget(QtWidgets.QWidget):
                 self._hover_last_key = None
                 self._hover_scrub(self._hover_pos)
 
-    def closeEvent(self, event):
+    def pause(self):
+        """Pause timers and hover preview while the window is hidden."""
+        self._refresh_timer.stop()
+        self._spin_timer.stop()
+        self._restore_hover_item()
+
+    def resume(self):
+        """Resume periodic thumbnail refresh when the window is shown again."""
+        if not self._closed:
+            self._refresh_timer.start(1500)
+
+    def shutdown(self):
+        """Stop all background threads and timers before widget destruction."""
+        self._closed = True
+        self.pause()
+        try:
+            self.list_widget.viewport().removeEventFilter(self)
+            self.list_widget.removeEventFilter(self)
+        except RuntimeError:
+            pass
         self.loader.shutdown()
+        self.missing_checker.stop()
+        if self.preview_worker is not None:
+            self.preview_worker.stop()
+
+    def closeEvent(self, event):
+        self.pause()
         super().closeEvent(event)

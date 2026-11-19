@@ -93,6 +93,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## My Modification update
 
+- **2026-11-19 | v1.01**: Fix Nuke crash when closing Asset Manager or exiting Nuke: switch `AssetManagerWindow` from `QMainWindow` to `QDialog` that saves state, pauses background work/timers, and hides safely on close/Esc instead of destroying; hook `QApplication.aboutToQuit` for clean teardown; use `Qt.QueuedConnection` and safe emit guards for all worker signals; replace non-daemon `ThreadPoolExecutor` workers with daemon threads (`ThumbLoader` and `AssetLibrary`); harden `UpdateDialog` close behavior and implement missing `check_for_updates_silently`; prefer `QMainWindow` in `get_nuke_main_window`.
 - [26-11-19]
   - **Scan crash / lost progress:** results are now saved to the library every 200 files during the scan, instead of only after 100%. A crash or cancel keeps everything already found
   - **Faster rescans:** files whose size and modified time match the library are skipped, so a rescan after a crash only processes what is new or changed

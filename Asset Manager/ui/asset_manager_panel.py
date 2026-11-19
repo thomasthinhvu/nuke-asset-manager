@@ -51,15 +51,21 @@ class AssetManagerPanel(QtWidgets.QWidget):
         self.current_category = None
         self._scan_queue = []
         self._scan_dialog = None
+        self._shutting_down = False
+        self._status_text = ""
 
         self._search_timer = QtCore.QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
         self._search_timer.timeout.connect(self._reload_assets)
 
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._clear_status_if_unchanged)
+
         self._setup_ui()
-        self.scan_progress.connect(self._on_scan_progress)
-        self.scan_completed.connect(self._on_scan_completed)
+        self.scan_progress.connect(self._on_scan_progress, Qt.QueuedConnection)
+        self.scan_completed.connect(self._on_scan_completed, Qt.QueuedConnection)
 
         self._restore_state()
         self._reload_all()
@@ -226,6 +232,8 @@ class AssetManagerPanel(QtWidgets.QWidget):
         return bar
 
     def _update_work_indicator(self):
+        if self._shutting_down:
+            return
         lib = self.library
         total, done = lib.thumb_total, lib.thumb_done
         if lib._thumb_running and total:
@@ -238,10 +246,16 @@ class AssetManagerPanel(QtWidgets.QWidget):
             self.work_label.hide()
             self.work_bar.hide()
 
+    def _clear_status_if_unchanged(self):
+        if not self._shutting_down and self.status.text() == self._status_text:
+            self.status.setText("")
+
     def _set_status(self, text, timeout_ms=4000):
+        self._status_text = text
         self.status.setText(text)
+        self._status_timer.stop()
         if timeout_ms:
-            QtCore.QTimer.singleShot(timeout_ms, lambda: self.status.text() == text and self.status.setText(""))
+            self._status_timer.start(timeout_ms)
 
     def _set_view_mode(self, mode):
         self.grid.set_view_mode(mode)
@@ -283,10 +297,12 @@ class AssetManagerPanel(QtWidgets.QWidget):
             return
         cfg.set('last_update_check', time.time())
         self._notifier = UpdateNotifier(self)
-        self._notifier.available.connect(self._show_update_button)
+        self._notifier.available.connect(self._show_update_button, Qt.QueuedConnection)
         self._notifier.check()
 
     def _show_update_button(self, version):
+        if self._shutting_down:
+            return
         from ..updater import version_tuple
         from ..config import APP_VERSION
         if version_tuple(version) <= version_tuple(APP_VERSION):
@@ -458,14 +474,26 @@ class AssetManagerPanel(QtWidgets.QWidget):
 
         # Called from the scanner thread -> only emit signals here
         def on_progress(current, total, filepath):
-            self.scan_progress.emit(current, total, filepath)
+            if self._shutting_down:
+                return
+            try:
+                self.scan_progress.emit(current, total, filepath)
+            except RuntimeError:
+                pass
 
         def on_complete(assets):
-            self.scan_completed.emit(assets, folder_id)
+            if self._shutting_down:
+                return
+            try:
+                self.scan_completed.emit(assets, folder_id)
+            except RuntimeError:
+                pass
 
         self.library.scan_folder(folder_id, on_progress, on_complete)
 
     def _on_scan_progress(self, current, total, filepath):
+        if self._shutting_down:
+            return
         # Only remember the latest value here. Updating the dialog inside this
         # handler calls processEvents(), which delivers the next queued progress
         # signal into this same method. On fast scans (EXR sequences) that
@@ -475,7 +503,7 @@ class AssetManagerPanel(QtWidgets.QWidget):
             self._scan_timer.start()
 
     def _flush_scan_progress(self):
-        if self._scan_flushing:
+        if self._shutting_down or self._scan_flushing:
             return
         dlg = self._scan_dialog
         latest = self._scan_latest
@@ -498,11 +526,18 @@ class AssetManagerPanel(QtWidgets.QWidget):
             self._scan_timer.stop()
         self._scan_latest = None
         if self._scan_dialog is not None:
-            self._scan_dialog.reset()
-            self._scan_dialog.deleteLater()
+            try:
+                self._scan_dialog.reset()
+                self._scan_dialog.hide()
+                self._scan_dialog.deleteLater()
+            except RuntimeError:
+                pass
             self._scan_dialog = None
+        if self._shutting_down:
+            return
         self._reload_all()
-        self.library.generate_all_thumbnails()
+        if self.isVisible():
+            self.library.generate_all_thumbnails()
         count = len(self._visible(self.library.search_assets(folder_id=folder_id)))
         self._set_status(f"Scan complete: {count} assets")
         if self._scan_queue:
@@ -511,7 +546,10 @@ class AssetManagerPanel(QtWidgets.QWidget):
     # ================================================================ misc
     def _message(self, title, text, icon=QtWidgets.QMessageBox.Information):
         box = QtWidgets.QMessageBox(icon, title, text, QtWidgets.QMessageBox.Ok, self)
-        box.exec_()
+        if hasattr(box, "exec"):
+            box.exec()
+        else:
+            box.exec_()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self.window():
@@ -529,6 +567,44 @@ class AssetManagerPanel(QtWidgets.QWidget):
     def refresh(self):
         self._reload_all()
 
-    def closeEvent(self, event):
+    def pause_background(self):
+        """Pause timers and background work while the window is hidden."""
+        self._work_timer.stop()
+        self._search_timer.stop()
+        self._status_timer.stop()
+        if getattr(self, "_scan_timer", None) is not None:
+            self._scan_timer.stop()
+        self._scan_queue.clear()
+        self._scan_latest = None
+        self.library.scanner.cancel_scan()
+        if self._scan_dialog is not None:
+            try:
+                self._scan_dialog.reset()
+                self._scan_dialog.hide()
+                self._scan_dialog.deleteLater()
+            except RuntimeError:
+                pass
+            self._scan_dialog = None
         self.library.stop_background_processing()
+        if hasattr(self, "grid") and self.grid is not None:
+            self.grid.pause()
+
+    def resume_background(self):
+        """Resume timers and thumbnail generation when the window is shown again."""
+        if self._shutting_down:
+            return
+        self._work_timer.start()
+        if hasattr(self, "grid") and self.grid is not None:
+            self.grid.resume()
+        self.library.generate_all_thumbnails()
+
+    def shutdown(self):
+        """Final teardown before Qt destroys widgets (e.g. Nuke exit)."""
+        self._shutting_down = True
+        self.pause_background()
+        if hasattr(self, "grid") and self.grid is not None:
+            self.grid.shutdown()
+
+    def closeEvent(self, event):
+        self.pause_background()
         super().closeEvent(event)
